@@ -4,10 +4,10 @@ import type { Mock } from "vitest"
 
 import { Anthropic } from "@anthropic-ai/sdk"
 import { TelemetryService } from "@roo-code/telemetry"
+import { ANTHROPIC_DEFAULT_MAX_TOKENS } from "@roo-code/types"
 
 import { ApiHandler } from "../../../api"
 import { ApiMessage } from "../../task-persistence/apiMessages"
-import { maybeRemoveImageBlocks } from "../../../api/transform/image-cleaning"
 import {
 	summarizeConversation,
 	getMessagesSinceLastSummary,
@@ -15,15 +15,14 @@ import {
 	cleanupAfterTruncation,
 	extractCommandBlocks,
 	injectSyntheticToolResults,
+	filterOrphanedToolResults,
+	removeImageBlocks,
+	getCondenseInputBudget,
 	toolUseToText,
 	toolResultToText,
 	convertToolBlocksToText,
 	transformMessagesForCondensing,
 } from "../index"
-
-vi.mock("../../../api/transform/image-cleaning", () => ({
-	maybeRemoveImageBlocks: vi.fn((messages: ApiMessage[], _apiHandler: ApiHandler) => [...messages]),
-}))
 
 vi.mock("@roo-code/telemetry", () => ({
 	TelemetryService: {
@@ -241,6 +240,133 @@ describe("injectSyntheticToolResults", () => {
 		const result = injectSyntheticToolResults(messages)
 		// Both tool_uses have matching tool_results, no injection needed
 		expect(result).toEqual(messages)
+	})
+})
+
+describe("filterOrphanedToolResults", () => {
+	it("should keep tool_result blocks whose tool_use is present", () => {
+		const messages: ApiMessage[] = [
+			{
+				role: "assistant",
+				content: [{ type: "tool_use", id: "tool-1", name: "read_file", input: { path: "a.ts" } }],
+				ts: 1,
+			},
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "tool-1", content: "contents" }], ts: 2 },
+		]
+
+		expect(filterOrphanedToolResults(messages)).toEqual(messages)
+	})
+
+	it("should drop orphan tool_result blocks and messages emptied by the filter", () => {
+		const messages: ApiMessage[] = [
+			{ role: "user", content: [{ type: "tool_result", tool_use_id: "missing", content: "orphan" }], ts: 1 },
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "keep me" },
+					{ type: "tool_result", tool_use_id: "missing", content: "orphan" },
+				],
+				ts: 2,
+			},
+			{ role: "assistant", content: "stay", ts: 3 },
+		]
+
+		const result = filterOrphanedToolResults(messages)
+
+		expect(result).toHaveLength(2)
+		expect(result[0].content).toEqual([{ type: "text", text: "keep me" }])
+		expect(result[1]).toEqual(messages[2])
+	})
+})
+
+describe("removeImageBlocks", () => {
+	it("should replace top-level image blocks with a text placeholder", () => {
+		const messages: ApiMessage[] = [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "Look at this" },
+					{ type: "image", source: { type: "base64", media_type: "image/png", data: "abc" } },
+				],
+				ts: 1,
+			},
+		]
+		const result = removeImageBlocks(messages)
+		expect(result).toHaveLength(1)
+		expect(result[0].content).toEqual([
+			{ type: "text", text: "Look at this" },
+			{ type: "text", text: "[Image]" },
+		])
+	})
+
+	it("should replace image blocks inside tool_result content arrays", () => {
+		const messages: ApiMessage[] = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "toolu_1",
+						content: [
+							{ type: "text", text: "Screenshot:" },
+							{
+								type: "image",
+								source: { type: "base64", media_type: "image/png", data: "abc" },
+							},
+						],
+					},
+				],
+				ts: 1,
+			},
+		]
+		const result = removeImageBlocks(messages)
+		const content = result[0].content as Anthropic.Messages.ContentBlockParam[]
+		const toolResult = content[0] as Anthropic.Messages.ToolResultBlockParam
+		expect(toolResult.type).toBe("tool_result")
+		expect(toolResult.content).toEqual([
+			{ type: "text", text: "Screenshot:" },
+			{ type: "text", text: "[Image]" },
+		])
+	})
+
+	it("should return messages unchanged when no image blocks exist", () => {
+		const messages: ApiMessage[] = [
+			{ role: "user", content: "plain string", ts: 1 },
+			{ role: "assistant", content: [{ type: "text", text: "text only" }], ts: 2 },
+		]
+		const result = removeImageBlocks(messages)
+		expect(result).toEqual(messages)
+	})
+})
+
+describe("getCondenseInputBudget", () => {
+	it("should compute context window minus reserved output tokens", () => {
+		const handler = {
+			getModel: () => ({ id: "m", info: { contextWindow: 8000, maxTokens: 4000 } }),
+		} as unknown as ApiHandler
+		expect(getCondenseInputBudget(handler)).toBe(4000)
+	})
+
+	it("should fall back to the Anthropic default max tokens when maxTokens is unavailable", () => {
+		const handler = {
+			getModel: () => ({ id: "m", info: { contextWindow: 16384 } }),
+		} as unknown as ApiHandler
+		expect(getCondenseInputBudget(handler)).toBe(16384 - ANTHROPIC_DEFAULT_MAX_TOKENS)
+	})
+
+	it("should prefer the condense context window override when present", () => {
+		const handler = {
+			getModel: () => ({ id: "m", info: { contextWindow: 8000, maxTokens: 4000 } }),
+			getCondenseContextWindow: () => 6000,
+		} as unknown as ApiHandler
+		expect(getCondenseInputBudget(handler)).toBe(2000)
+	})
+
+	it("should return 0 when no context window is known", () => {
+		const handler = {
+			getModel: () => ({ id: "m", info: { maxTokens: 4000 } }),
+		} as unknown as ApiHandler
+		expect(getCondenseInputBudget(handler)).toBe(0)
 	})
 })
 
@@ -750,7 +876,10 @@ describe("summarizeConversation", () => {
 
 		// Check that the API was called correctly
 		expect(mockApiHandler.createMessage).toHaveBeenCalled()
-		expect(maybeRemoveImageBlocks).toHaveBeenCalled()
+
+		// Image blocks must never reach the condense API (stripped unconditionally).
+		const requestMessages = (mockApiHandler.createMessage as Mock).mock.calls[0][1]
+		expect(JSON.stringify(requestMessages)).not.toContain('"type":"image"')
 
 		// Result contains all original messages (tagged) plus summary at end
 		expect(result.messages.length).toBe(messages.length + 1)
@@ -865,11 +994,6 @@ describe("summarizeConversation", () => {
 		const createMessageMock = vi.fn().mockReturnValue(emptyStream)
 		mockApiHandler.createMessage = createMessageMock as any
 
-		// We need to mock maybeRemoveImageBlocks to return the expected messages
-		;(maybeRemoveImageBlocks as Mock).mockImplementationOnce((messages: any) => {
-			return messages.map(({ role, content }: { role: string; content: any }) => ({ role, content }))
-		})
-
 		const result = await summarizeConversation({
 			messages,
 			apiHandler: mockApiHandler,
@@ -914,12 +1038,161 @@ describe("summarizeConversation", () => {
 		expect(actualPrompt).toContain("CRITICAL: This is a summarization-only request")
 		expect(actualPrompt).toContain("CRITICAL: This summarization request is a SYSTEM OPERATION")
 
-		// Check that maybeRemoveImageBlocks was called with the correct messages
-		// The final request message now contains the detailed CONDENSE instructions
-		const mockCallArgs = (maybeRemoveImageBlocks as Mock).mock.calls[0][0] as any[]
-		const finalMessage = mockCallArgs[mockCallArgs.length - 1]
+		// The final request message contains the detailed CONDENSE instructions
+		const requestMessages = (mockApiHandler.createMessage as Mock).mock.calls[0][1]
+		const finalMessage = requestMessages[requestMessages.length - 1]
 		expect(finalMessage.role).toBe("user")
-		expect(finalMessage.content).toContain("Your task is to create a detailed summary of the conversation")
+		expect(String(finalMessage.content)).toContain("Your task is to create a detailed summary of the conversation")
+	})
+
+	it("should not send messages hidden by an existing truncation marker to the condense API", async () => {
+		// A prior sliding-window truncation hid two messages behind a marker. Those
+		// hidden messages must NOT be re-sent in the condense request (they are not part
+		// of the active context), or the condense call can exceed the model's max input.
+		const truncationId = "trunc-1"
+		const messages: ApiMessage[] = [
+			{ role: "user", content: "OLD-ONE was hidden by truncation", truncationParent: truncationId, ts: 1 },
+			{ role: "assistant", content: "OLD-TWO was hidden by truncation", truncationParent: truncationId, ts: 2 },
+			{
+				role: "user",
+				content: "TRUNCATION-MARKER",
+				isTruncationMarker: true,
+				truncationId,
+				ts: 3,
+			},
+			{ role: "user", content: "ACTIVE-ONE recent turn", ts: 4 },
+			{ role: "assistant", content: "ACTIVE-TWO recent turn", ts: 5 },
+			{ role: "user", content: "ACTIVE-THREE recent turn", ts: 6 },
+		]
+
+		await summarizeConversation({
+			messages,
+			apiHandler: mockApiHandler,
+			systemPrompt: defaultSystemPrompt,
+			taskId,
+		})
+
+		const requestMessages = (mockApiHandler.createMessage as Mock).mock.calls[0][1]
+		const serialized = JSON.stringify(requestMessages)
+
+		// Hidden (truncated) messages are excluded from the condense input
+		expect(serialized).not.toContain("OLD-ONE was hidden")
+		expect(serialized).not.toContain("OLD-TWO was hidden")
+		// Active context is included
+		expect(serialized).toContain("ACTIVE-THREE recent turn")
+	})
+
+	it("should trim the oldest messages when the condense input exceeds the model input budget", async () => {
+		// Budget (from beforeEach mock: contextWindow 8000 - maxTokens 4000) = 4000.
+		// countTokens returns a fixed 100 per call: instructions 100 + system 100,
+		// so the body budget is 3800. With 40 messages (4000 tokens) the oldest 2 must be
+		// trimmed to keep the condense call within the model's max input.
+		const messages: ApiMessage[] = Array.from({ length: 40 }, (_, i) => {
+			const ts = i + 1
+			return i % 2 === 0
+				? { role: "user" as const, content: `MSG-${i}`, ts }
+				: { role: "assistant" as const, content: `MSG-${i}`, ts }
+		})
+
+		await summarizeConversation({
+			messages,
+			apiHandler: mockApiHandler,
+			systemPrompt: defaultSystemPrompt,
+			taskId,
+		})
+
+		const requestMessages = (mockApiHandler.createMessage as Mock).mock.calls[0][1]
+		const serialized = JSON.stringify(requestMessages)
+
+		// The newest message survives; the oldest message was trimmed away.
+		expect(serialized).toContain("MSG-19")
+		expect(serialized).not.toContain("MSG-0")
+	})
+
+	it("should not send image blocks to the condense API", async () => {
+		const messages: ApiMessage[] = [
+			{ role: "user", content: "Hello", ts: 1 },
+			{ role: "assistant", content: "Hi there", ts: 2 },
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "Look at this screenshot" },
+					{
+						type: "image",
+						source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+					},
+				],
+				ts: 3,
+			},
+			{ role: "assistant", content: "I see your screenshot", ts: 4 },
+			{ role: "user", content: "Thanks", ts: 5 },
+			{ role: "assistant", content: "You're welcome", ts: 6 },
+			{ role: "user", content: "Done", ts: 7 },
+		]
+
+		await summarizeConversation({
+			messages,
+			apiHandler: mockApiHandler,
+			systemPrompt: defaultSystemPrompt,
+			taskId,
+		})
+
+		const requestMessages = (mockApiHandler.createMessage as Mock).mock.calls[0][1]
+		const serialized = JSON.stringify(requestMessages)
+
+		// Raw image data must not reach the condense API; a text placeholder is used instead.
+		expect(serialized).not.toContain("aGVsbG8=")
+		expect(serialized).not.toContain('"type":"image"')
+		expect(serialized).toContain("[Image]")
+
+		// The stored history keeps the original image blocks (only the condense request is stripped).
+		expect(JSON.stringify(messages)).toContain("aGVsbG8=")
+	})
+
+	it("should not pass tool definitions to the condense API call", async () => {
+		const messages: ApiMessage[] = [
+			{ role: "user", content: "Hello", ts: 1 },
+			{ role: "assistant", content: "Hi there", ts: 2 },
+			{ role: "user", content: "How are you?", ts: 3 },
+		]
+
+		// Simulate the metadata built by Task.ts condense call sites, which include
+		// the full tool definitions for the normal API request.
+		const metadata = {
+			taskId,
+			mode: "code",
+			tools: [
+				{
+					type: "function" as const,
+					function: { name: "read_file", description: "Read a file", parameters: {} },
+				},
+			],
+			tool_choice: "auto" as const,
+			parallelToolCalls: true,
+			allowedFunctionNames: ["read_file"],
+		}
+
+		await summarizeConversation({
+			messages,
+			apiHandler: mockApiHandler,
+			systemPrompt: defaultSystemPrompt,
+			taskId,
+			metadata,
+		})
+
+		expect(mockApiHandler.createMessage).toHaveBeenCalledTimes(1)
+		const passedMetadata = (mockApiHandler.createMessage as Mock).mock.calls[0][2]
+
+		// Tool definitions must NOT be sent in the condense request: tool blocks
+		// are converted to text and the summary prompt forbids tool calls.
+		expect(passedMetadata.tools).toBeUndefined()
+		expect(passedMetadata.tool_choice).toBeUndefined()
+		expect(passedMetadata.parallelToolCalls).toBeUndefined()
+		expect(passedMetadata.allowedFunctionNames).toBeUndefined()
+
+		// Tracking fields are preserved.
+		expect(passedMetadata.taskId).toBe(taskId)
+		expect(passedMetadata.mode).toBe("code")
 	})
 
 	it("should include the original first user message in summarization input", async () => {
@@ -940,16 +1213,15 @@ describe("summarizeConversation", () => {
 			taskId,
 		})
 
-		const mockCallArgs = (maybeRemoveImageBlocks as Mock).mock.calls[0][0] as any[]
+		const requestMessages = (mockApiHandler.createMessage as Mock).mock.calls[0][1] as Anthropic.MessageParam[]
 
 		// Expect the original first user message to be present in the messages sent to the summarizer
-		const hasInitialAsk = mockCallArgs.some(
+		const hasInitialAsk = requestMessages.some(
 			(m) =>
 				m.role === "user" &&
 				(typeof m.content === "string"
 					? m.content === "Initial ask"
-					: Array.isArray(m.content) &&
-						m.content.some((b: any) => b.type === "text" && b.text === "Initial ask")),
+					: Array.isArray(m.content) && m.content.some((b) => b.type === "text" && b.text === "Initial ask")),
 		)
 		expect(hasInitialAsk).toBe(true)
 	})

@@ -616,7 +616,7 @@
 	},
 	"core/condense/__tests__/index.spec.ts": {
 		"@typescript-eslint/no-explicit-any": {
-			"count": 24
+			"count": 19
 		}
 	},
 	"core/config/ContextProxy.ts": {

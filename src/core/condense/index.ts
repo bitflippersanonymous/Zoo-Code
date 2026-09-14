@@ -2,11 +2,11 @@ import Anthropic from "@anthropic-ai/sdk"
 import crypto from "crypto"
 
 import { TelemetryService } from "@roo-code/telemetry"
+import { ANTHROPIC_DEFAULT_MAX_TOKENS } from "@roo-code/types"
 
 import { t } from "../../i18n"
 import { ApiHandler, ApiHandlerCreateMessageMetadata } from "../../api"
 import { ApiMessage } from "../task-persistence/apiMessages"
-import { maybeRemoveImageBlocks } from "../../api/transform/image-cleaning"
 import { findLast } from "../../shared/array"
 import { supportPrompt } from "../../shared/support-prompt"
 import { RooIgnoreController } from "../ignore/RooIgnoreController"
@@ -108,6 +108,40 @@ export function transformMessagesForCondensing<
 	}))
 }
 
+/**
+ * Removes reasoning content from messages so the condense request matches the size of a
+ * normal request.
+ *
+ * Normal requests run `buildCleanConversationHistory()`, which strips plain-text
+ * `{type:"reasoning"}` blocks when the model's `preserveReasoning` flag is not true. The
+ * condense path did not do this, so it shipped every turn's reasoning on top of the
+ * conversation — inflating the outgoing payload past the context window and causing
+ * guaranteed condense failures (the payload was a superset of the last normal request).
+ * Reasoning is irrelevant to summarization, so we drop standalone reasoning items and strip
+ * all `{type:"reasoning"}` content blocks (plain-text and encrypted) here.
+ *
+ * @param messages - The conversation messages to clean.
+ * @returns The messages with reasoning content removed.
+ */
+export function stripReasoningBlocks(messages: ApiMessage[]): ApiMessage[] {
+	return messages
+		.filter((msg) => msg.type !== "reasoning")
+		.map((msg) => {
+			if (!Array.isArray(msg.content)) {
+				return msg
+			}
+			const blocks = msg.content as Array<{ type: string } & object>
+			const kept = blocks.filter((block) => block.type !== "reasoning")
+			if (kept.length === blocks.length) {
+				return msg
+			}
+			if (kept.length === 1 && kept[0].type === "text") {
+				return { ...msg, content: (kept[0] as Anthropic.Messages.TextBlockParam).text }
+			}
+			return { ...msg, content: kept as Anthropic.Messages.ContentBlockParam[] }
+		})
+}
+
 export const MIN_CONDENSE_THRESHOLD = 5 // Minimum percentage of context window to trigger condensing
 export const MAX_CONDENSE_THRESHOLD = 100 // Maximum percentage of context window to trigger condensing
 
@@ -178,6 +212,143 @@ export function injectSyntheticToolResults(messages: ApiMessage[]): ApiMessage[]
 }
 
 /**
+ * Removes `tool_result` blocks whose referenced `tool_use` blocks are not present in the
+ * given message list (orphaned by a trim/condense boundary), dropping any user messages
+ * that end up with no content.
+ */
+export function filterOrphanedToolResults(messages: ApiMessage[]): ApiMessage[] {
+	const toolUseIds = new Set<string>()
+	for (const msg of messages) {
+		if (msg.role === "assistant" && Array.isArray(msg.content)) {
+			for (const block of msg.content) {
+				if (block.type === "tool_use" && block.id) {
+					toolUseIds.add(block.id)
+				}
+			}
+		}
+	}
+
+	return messages
+		.map((msg) => {
+			if (msg.role === "user" && Array.isArray(msg.content)) {
+				const filteredContent = msg.content.filter((block) =>
+					block.type === "tool_result" ? toolUseIds.has(block.tool_use_id) : true,
+				)
+				if (filteredContent.length === 0) {
+					return null
+				}
+				if (filteredContent.length !== msg.content.length) {
+					return { ...msg, content: filteredContent }
+				}
+			}
+			return msg
+		})
+		.filter((msg): msg is ApiMessage => msg !== null)
+}
+
+/**
+ * Unconditionally replaces image blocks with a "[Image]" text placeholder, both at the
+ * top level of message content and inside tool_result content arrays.
+ *
+ * Condensing only needs the conversation text; multimodal servers expand image blocks
+ * into large numbers of vision tokens, so raw image data in the condense input can push
+ * the request past the model's enforced input limit.
+ */
+export function removeImageBlocks(messages: ApiMessage[]): ApiMessage[] {
+	return messages.map((msg) => {
+		if (!Array.isArray(msg.content)) {
+			return msg
+		}
+		let changed = false
+		const content = msg.content.map((block) => {
+			if (block.type === "image") {
+				changed = true
+				return { type: "text" as const, text: "[Image]" }
+			}
+			if (block.type === "tool_result" && Array.isArray(block.content)) {
+				let toolChanged = false
+				const toolContent = block.content.map((item) => {
+					if (item.type === "image") {
+						toolChanged = true
+						return { type: "text" as const, text: "[Image]" }
+					}
+					return item
+				})
+				if (toolChanged) {
+					changed = true
+					return { ...block, content: toolContent }
+				}
+			}
+			return block
+		})
+		return changed ? { ...msg, content } : msg
+	})
+}
+
+/**
+ * Computes the maximum number of tokens the condense API call may send as input.
+ *
+ * Uses the same convention as `manageContext`: the model's input budget is the context
+ * window minus the reserved output (the model's maxTokens, or the Anthropic default when
+ * unavailable). Returns 0 when no usable budget can be derived (no context window known),
+ * in which case callers should skip token-counting and trimming.
+ */
+export function getCondenseInputBudget(apiHandler: ApiHandler): number {
+	const modelInfo = apiHandler.getModel().info
+	const contextWindow = apiHandler.getCondenseContextWindow?.() ?? modelInfo.contextWindow
+	if (!contextWindow || contextWindow <= 0) {
+		return 0
+	}
+	const reservedOutput =
+		modelInfo.maxTokens && modelInfo.maxTokens > 0 ? modelInfo.maxTokens : ANTHROPIC_DEFAULT_MAX_TOKENS
+	const budget = contextWindow - reservedOutput
+	return budget > 0 ? budget : 0
+}
+
+/**
+ * Trims the oldest messages from a condense request body so that the total input
+ * (body + instructions + summarizer system prompt) fits within `maxInputTokens`.
+ * Returns the messages unchanged when they already fit. After trimming, tool_use /
+ * tool_result integrity across the trim boundary is repaired: orphan `tool_result`
+ * blocks are dropped and any trailing orphan `tool_use` blocks are given synthetic results.
+ */
+async function trimCondenseInputToFit(
+	body: ApiMessage[],
+	instructions: Anthropic.MessageParam,
+	apiHandler: ApiHandler,
+	maxInputTokens: number,
+): Promise<ApiMessage[]> {
+	if (body.length <= 1) {
+		return body
+	}
+
+	const toBlocks = (content: ApiMessage["content"]): Anthropic.Messages.ContentBlockParam[] =>
+		typeof content === "string" ? [{ type: "text", text: content }] : content
+
+	const [bodyTokens, instructionsTokens, systemTokens] = await Promise.all([
+		Promise.all(body.map((msg) => apiHandler.countTokens(toBlocks(msg.content)))),
+		apiHandler.countTokens(toBlocks(instructions.content)),
+		apiHandler.countTokens([{ type: "text", text: SUMMARY_PROMPT }]),
+	])
+
+	const budget = maxInputTokens - instructionsTokens - systemTokens
+	const total = bodyTokens.reduce((sum, n) => sum + n, 0)
+	if (budget <= 0 || total <= budget) {
+		return body
+	}
+
+	let start = 0
+	let remaining = total
+	while (start < body.length - 1 && remaining - bodyTokens[start] > budget) {
+		remaining -= bodyTokens[start]
+		start++
+	}
+
+	const trimmed = body.slice(start)
+	return injectSyntheticToolResults(filterOrphanedToolResults(trimmed))
+}
+
+/**
  * Extracts <command> blocks from a message's content.
  * These blocks represent active workflows that must be preserved across condensings.
  *
@@ -236,6 +407,336 @@ export type SummarizeConversationOptions = {
 }
 
 /**
+ * Returns true when an API error indicates the request was rejected because the payload
+ * exceeded the model's context window (as opposed to, e.g., a rate limit or auth error).
+ *
+ * The full-context condense is always attempted first and only the server's rejection for
+ * context size engages the chunked fallback, because the local tiktoken estimator is not
+ * the model's tokenizer and is inaccurate for foreign tokenizers (e.g. Qwen) in both
+ * directions — a local pre-flight estimate cannot reliably decide single-vs-chunked.
+ *
+ * Matches the observed rejection wording across OpenAI-compatible servers, e.g. llama.cpp's
+ * `request (54390 tokens) exceeds the available context size (50176 tokens)`, plus common
+ * variants from other OpenAI-compatible providers.
+ */
+export function isCondenseContextSizeError(error: unknown): boolean {
+	if (!(error instanceof Error)) {
+		return false
+	}
+	const message = (error.message ?? "").toLowerCase()
+
+	// Phrasings that are unambiguously about context/payload size (no "context"
+	// keyword required):
+	// - "maximum context length is N tokens" (OpenAI)
+	// - "too many tokens in request"
+	// - "prompt is too long: N tokens > M maximum"
+	// - "request (N tokens) exceeds the available context size (M tokens)" (llama.cpp)
+	if (
+		/maximum context length/.test(message) ||
+		/too many tokens/.test(message) ||
+		/prompt is too long/.test(message) ||
+		/exceeds the available context size/.test(message)
+	) {
+		return true
+	}
+
+	// Other phrasings require the word "context" nearby to avoid false positives
+	// (e.g. rate-limit or "request too large" errors that happen to mention context).
+	const hasContext = /context/.test(message)
+	if (
+		hasContext &&
+		// "exceeds the context window", "exceeded the current context window", etc.
+		(/exceed\w*[^.!?]*context/.test(message) ||
+			// "prompt is too long: N tokens > M maximum" (variant without "prompt")
+			/too long[^.!?]*tokens/.test(message) ||
+			// "context window is too small"
+			/(context( window)? (is |is too )?too small)/.test(message) ||
+			// "request does not fit within the context"
+			/does not fit within/.test(message))
+	) {
+		return true
+	}
+
+	// Some SDKs attach the provider's error body separately (error.response / error.body).
+	// Check those too, in case the top-level message is just "400 Bad Request".
+	const anyError = error as unknown as Record<string, unknown>
+	for (const key of ["response", "body"]) {
+		const value = anyError[key]
+		if (value && typeof value === "object") {
+			try {
+				const text = JSON.stringify(value).toLowerCase()
+				if (/context/.test(text) && /exceed|maximum context length|too many tokens|too long/.test(text)) {
+					return true
+				}
+			} catch {
+				// Ignore serialization failures.
+			}
+		}
+	}
+	return false
+}
+
+/**
+ * Fraction of the context window that a single chunk of a chunked (rolling) condense may
+ * use. Each chunk request must also carry the running summary, the summary prompt, and the
+ * condense instructions, so chunks are packed to a value below the full budget to leave
+ * headroom.
+ *
+ * This is intentionally conservative (75%, not 90%): the per-message token counts that drive
+ * the packing come from the local tiktoken estimator, which is not the model's own tokenizer
+ * and can under- or over-count by a wide margin for foreign tokenizers. Packing to 75% leaves
+ * a 25% margin so a chunk that the local estimator thinks fits is very likely to fit at the
+ * server; the only cost of being conservative is one extra chunk in the worst case.
+ */
+const CONDENSE_CHUNK_CONTEXT_PERCENT = 0.75
+
+/**
+ * Splits a conversation into consecutive chunks, each within `chunkBudgetTokens`, for
+ * chunked (rolling) condensing.
+ *
+ * Messages are packed greedily from the oldest. Two constraints shape the boundaries:
+ *
+ * - A chunk never ends on an assistant message that contains `tool_use` blocks (when one
+ *   would otherwise be stranded at the boundary, it is moved to the start of the next
+ *   chunk so it stays with its `tool_result`).
+ * - A single message that alone exceeds the budget gets its own chunk and is reported
+ *   via `allChunksFit: false` — it cannot be split, so chunking cannot help.
+ *
+ * @param messages - The (reasoning-stripped, tool-injected) messages to split.
+ * @param apiHandler - The API handler used for local token counting.
+ * @param chunkBudgetTokens - Maximum tokens for a single chunk.
+ */
+export async function splitMessagesIntoCondenseChunks(
+	messages: ApiMessage[],
+	apiHandler: ApiHandler,
+	chunkBudgetTokens: number,
+): Promise<{ chunks: ApiMessage[][]; allChunksFit: boolean }> {
+	const flattenContent = (content: string | Anthropic.Messages.ContentBlockParam[]) =>
+		typeof content === "string" ? [{ type: "text" as const, text: content }] : content
+
+	const tokenCounts: number[] = []
+	for (const msg of messages) {
+		tokenCounts.push(await apiHandler.countTokens(flattenContent(msg.content)))
+	}
+
+	const endsWithPendingToolUse = (msg: ApiMessage): boolean => {
+		if (msg.role !== "assistant" || !Array.isArray(msg.content)) {
+			return false
+		}
+		return msg.content.some((block) => block.type === "tool_use")
+	}
+
+	const chunks: ApiMessage[][] = []
+	let allChunksFit = true
+	let i = 0
+	while (i < messages.length) {
+		let j = i
+		let total = 0
+		while (j < messages.length) {
+			const candidate = total + tokenCounts[j]
+			if (candidate > chunkBudgetTokens && j > i) {
+				break
+			}
+			total = candidate
+			j++
+		}
+		// Keep tool_use with its tool_result: don't end the chunk on a tool_use message.
+		let end = j
+		if (end > i && end < messages.length && end - i > 1 && endsWithPendingToolUse(messages[end - 1])) {
+			end -= 1
+		}
+		const chunk = messages.slice(i, end)
+		chunks.push(chunk)
+		// A single-message chunk over budget means one message exceeds the whole window.
+		if (chunk.length === 1 && tokenCounts[i] > chunkBudgetTokens) {
+			allChunksFit = false
+		}
+		i = end
+	}
+	return { chunks, allChunksFit }
+}
+
+/**
+ * Runs a single condense (summarization) request, draining the stream and accumulating
+ * the summary text and cost. Returns an error (with details) instead of throwing. The
+ * original `rawError` is also returned so callers can classify the failure (e.g. detect a
+ * server context-size rejection via `isCondenseContextSizeError`).
+ */
+async function runCondenseRequest(
+	apiHandler: ApiHandler,
+	systemPrompt: string,
+	requestMessages: Anthropic.Messages.MessageParam[],
+	metadata?: ApiHandlerCreateMessageMetadata,
+): Promise<{ summary: string; cost: number; error?: string; errorDetails?: string; rawError?: unknown }> {
+	let summary = ""
+	let cost = 0
+	try {
+		const stream = apiHandler.createMessage(systemPrompt, requestMessages, metadata)
+
+		for await (const chunk of stream) {
+			if (chunk.type === "text") {
+				summary += chunk.text
+			} else if (chunk.type === "usage") {
+				// Record final usage chunk only
+				cost = chunk.totalCost ?? 0
+			}
+		}
+		return { summary, cost }
+	} catch (error) {
+		console.error("Error during condensing API call:", error)
+		const errorMessage = error instanceof Error ? error.message : String(error)
+
+		// Capture detailed error information for debugging
+		let errorDetails = ""
+		if (error instanceof Error) {
+			errorDetails = `Error: ${error.message}`
+			// Capture any additional API error properties
+			const anyError = error as unknown as Record<string, unknown>
+			if (anyError.status) {
+				errorDetails += `\n\nHTTP Status: ${anyError.status}`
+			}
+			if (anyError.code) {
+				errorDetails += `\nError Code: ${anyError.code}`
+			}
+			if (anyError.response) {
+				try {
+					errorDetails += `\n\nAPI Response:\n${JSON.stringify(anyError.response, null, 2)}`
+				} catch {
+					errorDetails += `\n\nAPI Response: [Unable to serialize]`
+				}
+			}
+			if (anyError.body) {
+				try {
+					errorDetails += `\n\nResponse Body:\n${JSON.stringify(anyError.body, null, 2)}`
+				} catch {
+					errorDetails += `\n\nResponse Body: [Unable to serialize]`
+				}
+			}
+		} else {
+			errorDetails = String(error)
+		}
+
+		return {
+			summary,
+			cost,
+			error: t("common:errors.condense_api_failed", { message: errorMessage }),
+			errorDetails,
+			rawError: error,
+		}
+	}
+}
+
+/**
+ * Condenses a conversation that is too large for a single request by summarizing it in
+ * chunks (rolling summary): each chunk request carries the previous chunks' summary plus
+ * the next chunk of messages. The final chunk's summary is a global summary of the whole
+ * conversation, so no messages are lost — the non-destructive end state (one summary
+ * message + originals tagged `condenseParent`) is identical to a single condense.
+ *
+ * Returns an error (for the caller to fall back to truncation) when a single message
+ * alone exceeds the window (cannot be split) or a chunk request fails.
+ */
+async function runChunkedCondense({
+	messages,
+	condenseInstructions,
+	apiHandler,
+	metadata,
+}: {
+	messages: ApiMessage[]
+	condenseInstructions: string
+	apiHandler: ApiHandler
+	metadata?: ApiHandlerCreateMessageMetadata
+}): Promise<{ summary?: string; cost: number; error?: string; errorDetails?: string }> {
+	const modelInfo = apiHandler.getModel().info
+	const contextWindow = apiHandler.getCondenseContextWindow?.() ?? modelInfo.contextWindow
+	const reservedTokens =
+		modelInfo.maxTokens && modelInfo.maxTokens > 0 ? modelInfo.maxTokens : ANTHROPIC_DEFAULT_MAX_TOKENS
+
+	// Fixed overhead of each chunk request (system prompt + tool definitions + the
+	// condense instructions), so chunks are packed to leave room for it plus the
+	// running summary (covered by the CONDENSE_CHUNK_CONTEXT_PERCENT headroom).
+	const overheadTokens =
+		(await apiHandler.countTokens([{ type: "text", text: SUMMARY_PROMPT }])) +
+		(metadata?.tools && metadata.tools.length > 0
+			? await apiHandler.countTokens([{ type: "text", text: JSON.stringify(metadata.tools) }])
+			: 0) +
+		(await apiHandler.countTokens([{ type: "text", text: condenseInstructions }]))
+
+	const chunkBudgetTokens =
+		Math.floor(contextWindow * CONDENSE_CHUNK_CONTEXT_PERCENT) - reservedTokens - overheadTokens
+
+	// Not even one message's worth of headroom: chunking cannot help.
+	if (chunkBudgetTokens <= 0) {
+		return {
+			cost: 0,
+			error: t("common:errors.condense_truncation_still_exceeds", { window: contextWindow }),
+		}
+	}
+
+	const { chunks, allChunksFit } = await splitMessagesIntoCondenseChunks(messages, apiHandler, chunkBudgetTokens)
+
+	// A single message alone exceeds the window — it cannot be split; chunking is
+	// impossible, so the caller falls back to truncation with an actionable error.
+	if (!allChunksFit) {
+		return {
+			cost: 0,
+			error: t("common:errors.condense_truncation_still_exceeds", { window: contextWindow }),
+		}
+	}
+
+	// Build the trailing instruction message for a chunk. For the last chunk, tell the
+	// model to merge the earlier partial summary into one complete summary.
+	const buildInstructionContent = (
+		runningSummary: string,
+		isLast: boolean,
+	): Anthropic.Messages.ContentBlockParam[] => {
+		const blocks: Anthropic.Messages.ContentBlockParam[] = []
+		if (runningSummary) {
+			blocks.push({
+				type: "text",
+				text: `## Summary of the earlier part of this conversation (from a previous chunk)\n${runningSummary}`,
+			})
+		}
+		const instructionText = isLast
+			? `${condenseInstructions}\n\nNOTE: This conversation is longer than the model's context window, so it is being summarized in chunks. The part of the conversation before the messages above was already summarized (provided in the block above, if present). Produce ONE complete summary of the ENTIRE conversation by merging that earlier summary with the messages above. Preserve all important details from both.`
+			: `${condenseInstructions}\n\nNOTE: This conversation is longer than the model's context window, so it is being summarized in chunks. You are only seeing a part of the conversation here; more chunks will follow. Produce a detailed, complete summary of this part (including the earlier part, if a summary of it is provided in a block above). Do not conclude or wrap up the conversation; it continues in later chunks.`
+		blocks.push({ type: "text", text: instructionText })
+		return blocks
+	}
+
+	let runningSummary = ""
+	let totalCost = 0
+
+	for (let i = 0; i < chunks.length; i++) {
+		const isLast = i === chunks.length - 1
+		const chunkMessages: ApiMessage[] = [
+			...chunks[i],
+			{ role: "user", content: buildInstructionContent(runningSummary, isLast), ts: Date.now() },
+		]
+
+		// Strip image blocks so multimodal payloads cannot push a chunk over the limit.
+		const requestMessages = transformMessagesForCondensing(removeImageBlocks(chunkMessages)).map(
+			({ role, content }) => ({ role, content }),
+		)
+
+		const result = await runCondenseRequest(apiHandler, SUMMARY_PROMPT, requestMessages, metadata)
+		totalCost += result.cost
+		if (result.error || !result.summary?.trim()) {
+			// A chunk failed; the conversation can't be fully summarized in chunks, so
+			// let the caller fall back to truncation.
+			return {
+				cost: totalCost,
+				error: result.error ?? t("common:errors.condense_failed"),
+				errorDetails: result.errorDetails,
+			}
+		}
+		runningSummary = result.summary.trim()
+	}
+
+	return { summary: runningSummary, cost: totalCost }
+}
+
+/**
  * Summarizes the conversation messages using an LLM call.
  *
  * This implements the "fresh start" model where:
@@ -275,8 +776,19 @@ export async function summarizeConversation(options: SummarizeConversationOption
 
 	const response: SummarizeResponse = { messages, cost: 0, summary: "" }
 
-	// Get messages to summarize (all messages since the last summary, if any)
-	const messagesToSummarize = getMessagesSinceLastSummary(messages)
+	// Validate that the API handler supports message creation before doing any work.
+	if (!apiHandler || typeof apiHandler.createMessage !== "function") {
+		console.error("API handler is invalid for condensing. Cannot proceed.")
+		const error = t("common:errors.condense_handler_invalid")
+		return { ...response, error }
+	}
+
+	// Get messages to summarize (all ACTIVE messages since the last summary, if any).
+	// Base this on the effective history so that messages already hidden by a
+	// sliding-window truncation marker (truncationParent) or an existing summary are
+	// NOT re-sent in the condense request. Without this the condense call can include
+	// far more than the active context and exceed the model's max input length.
+	const messagesToSummarize = getMessagesSinceLastSummary(getEffectiveApiHistory(messages))
 
 	if (messagesToSummarize.length <= 1) {
 		const error =
@@ -303,86 +815,100 @@ export async function summarizeConversation(options: SummarizeConversationOption
 		content: condenseInstructions,
 	}
 
-	// Inject synthetic tool_results for orphan tool_calls to prevent API rejections
+	// Strip reasoning so the condense payload matches a normal request (see stripReasoningBlocks):
+	// normal requests clean reasoning blocks out of the history, so without this the condense
+	// call ships every turn's reasoning on top of the conversation — inflating the payload past
+	// the context window and causing guaranteed failures (issue #1342).
+	// Then inject synthetic tool_results for orphan tool_calls to prevent API rejections
 	// (e.g., when user triggers condense after receiving attempt_completion but before responding)
-	const messagesWithToolResults = injectSyntheticToolResults(messagesToSummarize)
+	let condenseBody = injectSyntheticToolResults(stripReasoningBlocks(messagesToSummarize))
+
+	// Unconditionally strip image blocks from the condense input. Summarization only
+	// needs the conversation text, and multimodal servers expand image blocks into
+	// thousands of vision tokens — raw image data in the condense request can push it
+	// past the model's enforced input limit even when the text alone would fit.
+	condenseBody = removeImageBlocks(condenseBody)
+
+	// Defensive guard: if the messages to summarize would still exceed the model's
+	// input budget (countTokens is only an estimate), trim the oldest messages so the
+	// condense call itself cannot exceed the max input length.
+	const maxInputTokens = getCondenseInputBudget(apiHandler)
+	if (maxInputTokens > 0) {
+		condenseBody = await trimCondenseInputToFit(condenseBody, finalRequestMessage, apiHandler, maxInputTokens)
+	}
 
 	// Transform tool_use and tool_result blocks to text representations.
 	// This is necessary because some providers (like Bedrock via LiteLLM) require the `tools` parameter
 	// when tool blocks are present. By converting them to text, we can send the conversation for
 	// summarization without needing to pass the tools parameter.
-	const messagesWithTextToolBlocks = transformMessagesForCondensing(
-		maybeRemoveImageBlocks([...messagesWithToolResults, finalRequestMessage], apiHandler),
-	)
+	const messagesWithTextToolBlocks = transformMessagesForCondensing([...condenseBody, finalRequestMessage])
 
 	const requestMessages = messagesWithTextToolBlocks.map(({ role, content }) => ({ role, content }))
 
-	// Note: this doesn't need to be a stream, consider using something like apiHandler.completePrompt
-	const promptToUse = SUMMARY_PROMPT
-
-	// Validate that the API handler supports message creation
-	if (!apiHandler || typeof apiHandler.createMessage !== "function") {
-		console.error("API handler is invalid for condensing. Cannot proceed.")
-		const error = t("common:errors.condense_handler_invalid")
-		return { ...response, error }
-	}
-
 	let summary = ""
 	let cost = 0
-	let outputTokens = 0
 
-	try {
-		const stream = apiHandler.createMessage(promptToUse, requestMessages, metadata)
+	// The condense request must NOT include tool definitions: tool blocks are
+	// already converted to text (transformMessagesForCondensing) and SUMMARY_PROMPT
+	// instructs the model not to call tools. Sending tool definitions inflates the
+	// condense payload and can push the request over the model's context limit
+	// (issue #11998). Strip tool-related fields, but keep tracking/abort fields.
+	// The original `metadata` is retained below for the newContextTokens estimate.
+	const condenseMetadata: ApiHandlerCreateMessageMetadata | undefined = metadata
+		? {
+				taskId: metadata.taskId,
+				mode: metadata.mode,
+				suppressPreviousResponseId: metadata.suppressPreviousResponseId,
+				store: metadata.store,
+				abortSignal: metadata.abortSignal,
+			}
+		: undefined
 
-		for await (const chunk of stream) {
-			if (chunk.type === "text") {
-				summary += chunk.text
-			} else if (chunk.type === "usage") {
-				// Record final usage chunk only
-				cost = chunk.totalCost ?? 0
-				outputTokens = chunk.outputTokens ?? 0
+	// The full-context condense is always attempted first. This preserves the existing
+	// behavior for providers/models that already condense the whole conversation in one
+	// request; the chunked (rolling) fallback below is only engaged when the SERVER
+	// rejects the full request for context size — the authoritative signal that it cannot
+	// fit. The local token estimate (pre-flight trim above) is not the model's tokenizer
+	// and is unreliable for foreign tokenizers, so a server rejection is the only reliable
+	// trigger for chunking.
+	const single = await runCondenseRequest(apiHandler, SUMMARY_PROMPT, requestMessages, condenseMetadata)
+
+	if (single.error && isCondenseContextSizeError(single.rawError)) {
+		// The server rejected the full-context condense because the payload exceeded the
+		// context window. Condense in chunks (rolling summary) so no messages are lost.
+		console.info("[condense] Server rejected the full condense (context too large); condensing in chunks.")
+		const chunkResult = await runChunkedCondense({
+			messages: condenseBody,
+			condenseInstructions,
+			apiHandler,
+			metadata: condenseMetadata,
+		})
+		if (chunkResult.error || !chunkResult.summary?.trim()) {
+			// Chunking could not produce a summary (e.g. a single message alone exceeds
+			// the window, or a chunk request failed); fall back to truncation with a
+			// clear, actionable message.
+			console.warn("[condense] Chunked condense failed; falling back to truncation.")
+			return {
+				...response,
+				cost: chunkResult.cost,
+				error: chunkResult.error ?? t("common:errors.condense_failed"),
+				errorDetails: chunkResult.errorDetails,
 			}
 		}
-	} catch (error) {
-		console.error("Error during condensing API call:", error)
-		const errorMessage = error instanceof Error ? error.message : String(error)
-
-		// Capture detailed error information for debugging
-		let errorDetails = ""
-		if (error instanceof Error) {
-			errorDetails = `Error: ${error.message}`
-			// Capture any additional API error properties
-			const anyError = error as unknown as Record<string, unknown>
-			if (anyError.status) {
-				errorDetails += `\n\nHTTP Status: ${anyError.status}`
-			}
-			if (anyError.code) {
-				errorDetails += `\nError Code: ${anyError.code}`
-			}
-			if (anyError.response) {
-				try {
-					errorDetails += `\n\nAPI Response:\n${JSON.stringify(anyError.response, null, 2)}`
-				} catch {
-					errorDetails += `\n\nAPI Response: [Unable to serialize]`
-				}
-			}
-			if (anyError.body) {
-				try {
-					errorDetails += `\n\nResponse Body:\n${JSON.stringify(anyError.body, null, 2)}`
-				} catch {
-					errorDetails += `\n\nResponse Body: [Unable to serialize]`
-				}
-			}
-		} else {
-			errorDetails = String(error)
-		}
-
+		summary = chunkResult.summary
+		cost = chunkResult.cost
+	} else if (single.error) {
+		// Failed for a non-context-size reason — surface the original error and let
+		// callers fall back to truncation.
 		return {
 			...response,
-			cost,
-			error: t("common:errors.condense_api_failed", { message: errorMessage }),
-			errorDetails,
+			cost: single.cost,
+			error: single.error,
+			errorDetails: single.errorDetails,
 		}
+	} else {
+		summary = single.summary
+		cost = single.cost
 	}
 
 	summary = summary.trim()
@@ -552,42 +1078,9 @@ export function getEffectiveApiHistory(messages: ApiMessage[]): ApiMessage[] {
 		const summaryIndex = messages.indexOf(lastSummary)
 		let messagesFromSummary = messages.slice(summaryIndex)
 
-		// Collect all tool_use IDs from assistant messages in the result
-		// This is needed to filter out orphan tool_result blocks that reference
-		// tool_use IDs from messages that were condensed away
-		const toolUseIds = new Set<string>()
-		for (const msg of messagesFromSummary) {
-			if (msg.role === "assistant" && Array.isArray(msg.content)) {
-				for (const block of msg.content) {
-					if (block.type === "tool_use" && (block as Anthropic.Messages.ToolUseBlockParam).id) {
-						toolUseIds.add((block as Anthropic.Messages.ToolUseBlockParam).id)
-					}
-				}
-			}
-		}
-
-		// Filter out orphan tool_result blocks from user messages
-		messagesFromSummary = messagesFromSummary
-			.map((msg) => {
-				if (msg.role === "user" && Array.isArray(msg.content)) {
-					const filteredContent = msg.content.filter((block) => {
-						if (block.type === "tool_result") {
-							return toolUseIds.has((block as Anthropic.Messages.ToolResultBlockParam).tool_use_id)
-						}
-						return true
-					})
-					// If all content was filtered out, mark for removal
-					if (filteredContent.length === 0) {
-						return null
-					}
-					// If some content was filtered, return updated message
-					if (filteredContent.length !== msg.content.length) {
-						return { ...msg, content: filteredContent }
-					}
-				}
-				return msg
-			})
-			.filter((msg): msg is ApiMessage => msg !== null)
+		// Filter out orphan tool_result blocks that reference tool_use IDs from
+		// messages that were condensed away (or trimmed before the summary)
+		messagesFromSummary = filterOrphanedToolResults(messagesFromSummary)
 
 		// Still need to filter out any truncated messages within this range
 		const existingTruncationIds = new Set<string>()
