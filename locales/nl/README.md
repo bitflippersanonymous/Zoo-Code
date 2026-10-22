@@ -47,11 +47,11 @@ Zoo Code bouwt voort op het fundament van Roo Code en breidt dit verder uit met:
 - **Betrouwbaardere terminal- en bewerkingsworkflows** — oplossingen voor voortijdige terminalvoltooiing, race conditions in taakstatussen, contextbeheer, diff-bewerking en providerspecifiek toolgebruik.
 - **Meer controle over je workspace** — regelbeheer, MCP-beperkingen per modus, padbeheer voor multi-root-workspaces, reasoning-opties voor modellen en acties om wijzigingen bij voltooiing te beoordelen.
 
-## Nieuw in v3.82.0
+## Nieuw in v3.90.0
 
-- 🔑 **Gebruik je Zoo Gateway API-sleutel overal** — voeg hem toe aan elke OpenAI-compatibele client of workflow: https://zoocode.dev/models
-- 🎁 **Tijdelijk gratis modeltoegang** — krijg gratis toegang tot MiniMax-M3 via Zoo Gateway.
-- ✨ **Gloednieuwe modellen** — GPT-6 Astra en Claude Fable 5.1 zijn nu beschikbaar.
+- ✨ **Providers en modellen:** GitHub Copilot is nu een provider: meld je aan en Zoo Code laadt je Copilot-modellen. IO Intelligence is een provider met een eigen API-sleutel. Gemini 4 Argon staat op Gemini en Vertex. GPT-6 Luna staat op OpenCode Go. Gemini 4 Argon en GPT-6 Luna staan ook op Zoo Gateway.
+- 🧭 **Tool-uitvoering:** Dezelfde tool-aanroep herhalen geeft een waarschuwing, daarna stopt Zoo Code die lus. `attempt_completion` uitschakelen laat een taak niet langer onafgemaakt. Berichten in de wachtrij doorlopen dezelfde command-protection-controles als opdrachten die je direct verstuurt.
+- ⚡ **Redeneren en streaming:** Adaptief denken van Anthropic verschijnt in de chat en thinking tokens worden geteld. De R1-schakelaar bewaart redenering van llama.cpp, Ollama en LM Studio. Codex bewaart versleutelde redenering bij de samenvatting die je ziet. VS Code language-model-streams gebruiken guarded recovery als een stream mislukt.
 
 ## Wat kan Zoo Code voor JOU doen?
 

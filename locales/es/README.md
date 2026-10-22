@@ -47,11 +47,11 @@ Zoo Code parte de los cimientos creados por Roo Code y continúa ampliándolos c
 - **Flujos de terminal y edición más fiables** — correcciones para la finalización prematura del terminal, las condiciones de carrera del estado de las tareas, la gestión del contexto, la edición de diff y el uso de herramientas específicas de cada proveedor.
 - **Más control sobre tu espacio de trabajo** — gestión de reglas, restricciones de MCP por modo, controles de rutas multirraíz, opciones de razonamiento de modelos y acciones para revisar los cambios al completar una tarea.
 
-## Novedades de la v3.82.0
+## Novedades de la v3.90.0
 
-- 🔑 **Usa tu clave API de Zoo Gateway en cualquier lugar** — llévala a cualquier cliente o flujo de trabajo compatible con OpenAI: https://zoocode.dev/models
-- 🎁 **Acceso gratis al modelo por tiempo limitado** — obtén acceso gratis a MiniMax-M3 mediante Zoo Gateway.
-- ✨ **Modelos completamente nuevos** — GPT-6 Astra y Claude Fable 5.1 ya están disponibles.
+- ✨ **Proveedores y modelos:** GitHub Copilot ahora es un proveedor: inicia sesión y Zoo Code carga tus modelos de Copilot. IO Intelligence es un proveedor con su propia clave de API. Gemini 4 Argon está en Gemini y Vertex. GPT-6 Luna está en OpenCode Go. Gemini 4 Argon y GPT-6 Luna también están en Zoo Gateway.
+- 🧭 **Ejecución de herramientas:** Repetir la misma llamada de herramienta muestra una advertencia y luego Zoo Code detiene ese bucle. Desactivar `attempt_completion` ya no deja una tarea sin poder terminar. Los mensajes en cola pasan las mismas comprobaciones de protección de comandos que los comandos que envías directamente.
+- ⚡ **Razonamiento y streaming:** El pensamiento adaptativo de Anthropic se muestra en el chat y se cuentan los thinking tokens. El interruptor R1 conserva el razonamiento de llama.cpp, Ollama y LM Studio. Codex conserva el razonamiento cifrado junto al resumen que ves. Los streams del modelo de lenguaje de VS Code usan recuperación protegida cuando un stream falla.
 
 ## ¿Qué puede hacer Zoo Code por TI?
 

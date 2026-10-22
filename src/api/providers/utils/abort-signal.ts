@@ -1,18 +1,24 @@
 /**
  * Merge an optional external abort signal with an optional timeout.
  *
- * Timeout values <= 0 are treated as disabled. The timeout is created via the
+ * Timeout values <= 0 and non-finite values are treated as disabled; finite
+ * delays above 2^31-1 ms are capped (Node clamps them to 1 ms otherwise). The timeout is created via the
  * native AbortSignal.timeout() API, which self-manages its timer — callers do
  * not need to (and cannot) clear it manually.
  */
 export function mergeAbortSignalAndTimeout(externalSignal?: AbortSignal, timeoutMs?: number): AbortSignal | undefined {
-	const hasTimeout = typeof timeoutMs === "number" && timeoutMs > 0
+	// Node's AbortSignal.timeout() throws ERR_OUT_OF_RANGE for non-integer
+	// delays (Infinity) and clamps delays above 2^31-1 ms to 1 ms, which would
+	// abort almost immediately; treat non-finite values as "no timeout",
+	// round fractional delays up to whole milliseconds (uint32 validation
+	// throws for 1500.5), and cap the rest.
+	const hasTimeout = typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
 
 	if (!hasTimeout) {
 		return externalSignal
 	}
 
-	const timeoutSignal = AbortSignal.timeout(timeoutMs)
+	const timeoutSignal = AbortSignal.timeout(Math.min(Math.max(1, Math.ceil(timeoutMs)), 2_147_483_647))
 
 	if (!externalSignal) {
 		return timeoutSignal
@@ -54,31 +60,21 @@ export function throwIfAborted(signal?: AbortSignal): void {
 }
 
 /**
- * Request options this series passes to the OpenAI SDK call. The SDK's
- * `RequestOptions` declares `signal` as `AbortSignal | null | undefined`,
- * which does not satisfy the builder's base constraint, so the builder is
- * typed with only the options this series sets. The built config is still
- * assignable to the SDK's `RequestOptions`.
- */
-export type OpenAiRequestOptions = {
-	signal?: AbortSignal
-}
-
-/**
  * Whether a failure indicates an aborted request: the caller's signal fired,
- * the SDK raised a native abort error, or the error carries the OpenAI SDK
- * abort error message (exactly "Request was aborted."). The message check
- * is an exact match on purpose: a substring match would misclassify
- * unrelated errors that merely mention aborting.
+ * an `Error` carries a native abort error name (`AbortError`,
+ * `APIUserAbortError`), or an `Error` carries the OpenAI SDK abort error
+ * message (exactly "Request was aborted.").
+ *
+ * The name and message checks require an `Error` instance on purpose: a
+ * plain object that merely looks like an abort must propagate unchanged so
+ * callers can inspect the real failure shape. The message check is an exact
+ * match on purpose: a substring match would misclassify unrelated errors
+ * that merely mention aborting.
  */
 export function isRequestAborted(error: unknown, signal?: AbortSignal): boolean {
-	const candidate = error as { name?: string; message?: string }
-	return (
-		Boolean(signal?.aborted) ||
-		candidate?.name === "AbortError" ||
-		candidate?.name === "APIUserAbortError" ||
-		candidate?.message === "Request was aborted."
-	)
+	const hasAbortName = error instanceof Error && (error.name === "AbortError" || error.name === "APIUserAbortError")
+	const hasSdkAbortMessage = error instanceof Error && error.message === "Request was aborted."
+	return Boolean(signal?.aborted) || hasAbortName || hasSdkAbortMessage
 }
 
 /**
@@ -92,4 +88,76 @@ export function createAbortError(providerName: string): Error {
 	const abortError = new Error(`The ${providerName} request was aborted`)
 	abortError.name = "AbortError"
 	return abortError
+}
+
+/**
+ * Await `pending` but reject with the provider's abort error when `signal`
+ * aborts first. For async phases that have no native signal support (model
+ * discovery) yet must still settle promptly on cancellation. The underlying
+ * promise keeps running (its settlement is ignored) — cancellation is
+ * cooperative at this boundary.
+ *
+ * The abort listener is detached once `pending` settles (success or
+ * failure), so repeated calls on one signal do not accumulate listeners.
+ */
+export function rejectOnAbort<T>(pending: Promise<T>, signal: AbortSignal, providerName: string): Promise<T> {
+	if (signal.aborted) {
+		// The caller has already cancelled, so this branch never consumes `pending`;
+		// attach a handler anyway so a rejecting `pending` cannot surface as an
+		// unhandled rejection.
+		void pending.catch(() => {})
+		return Promise.reject(createAbortError(providerName))
+	}
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => reject(createAbortError(providerName))
+		// Stryker disable next-line ObjectLiteral,BooleanLiteral: a signal fires its abort event exactly once and the settle handler removes this listener, so the once flag is unobservable
+		signal.addEventListener("abort", onAbort, { once: true })
+		void pending.then(
+			(value) => {
+				signal.removeEventListener("abort", onAbort)
+				resolve(value)
+			},
+			(error) => {
+				signal.removeEventListener("abort", onAbort)
+				reject(error)
+			},
+		)
+	})
+}
+
+/**
+ * Resolve a provider's model metadata inside a cancellation scope.
+ *
+ * A pre-aborted signal rejects immediately with the standardized AbortError
+ * before any lookup starts; a signal that fires while the lookup is pending
+ * settles via {@link rejectOnAbort} instead of waiting for the catalog to
+ * resolve. Abort failures from the lookup itself are normalized to the
+ * provider AbortError; any other resolution failure propagates unchanged.
+ *
+ * Accepts a provider-specific resolution step so the entry guard, race, and
+ * normalization can share one implementation. Direct contract tests cover
+ * this helper; providers do not currently call it.
+ *
+ * @internal Shared cancellation helper retained with direct contract tests for provider adoption.
+ */
+export async function resolveModelWithAbort<T>(
+	fetchModel: () => Promise<T>,
+	abortSignal: AbortSignal | undefined,
+	providerName: string,
+): Promise<T> {
+	if (abortSignal?.aborted) {
+		throw createAbortError(providerName)
+	}
+
+	try {
+		if (abortSignal) {
+			return await rejectOnAbort(fetchModel(), abortSignal, providerName)
+		}
+		return await fetchModel()
+	} catch (error) {
+		if (isRequestAborted(error, abortSignal)) {
+			throw createAbortError(providerName)
+		}
+		throw error
+	}
 }

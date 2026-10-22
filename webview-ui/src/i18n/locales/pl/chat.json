@@ -113,6 +113,15 @@
 	},
 	"selectMode": "Wybierz tryb interakcji",
 	"selectApiConfig": "Wybierz konfigurację API",
+	"selectModel": "Wybierz model",
+	"modelSelector": {
+		"title": "Modele",
+		"settings": "Ustawienia modelu",
+		"description": "Wybierz model używany w tej konfiguracji API.",
+		"searchPlaceholder": "Szukaj modeli...",
+		"unsupportedTooltip": "Model tego dostawcy jest konfigurowany w Ustawieniach",
+		"loading": "Ładowanie modeli..."
+	},
 	"lockApiConfigAcrossModes": "Zablokuj konfigurację API dla wszystkich trybów w tym obszarze roboczym",
 	"unlockApiConfigAcrossModes": "Konfiguracja API jest zablokowana dla wszystkich trybów w tym obszarze roboczym (kliknij, aby odblokować)",
 	"enhancePrompt": "Ulepsz podpowiedź dodatkowym kontekstem",
@@ -343,10 +352,10 @@
 		"title": "Zoo Code {{version}} wydany",
 		"support": "Wesprzyj Zoo Code, dając nam gwiazdkę na <githubLink>GitHub</githubLink>.",
 		"release": {
-			"heading": "Co nowego:",
-			"highlight1": "🔑 Używaj swojego klucza API Zoo Gateway wszędzie—dodaj go do dowolnego klienta lub workflow zgodnego z OpenAI: <modelsLink>https://zoocode.dev/models</modelsLink>",
-			"highlight2": "🎁 Przez ograniczony czas korzystaj bezpłatnie z MiniMax-M3 przez Zoo Gateway.",
-			"highlight3": "✨ Już dostępne: zupełnie nowe modele GPT-6 Astra i Claude Fable 5.1."
+			"heading": "Nowości w Zoo Code v3.90.0",
+			"highlight1": "✨ Dostawcy i modele: GitHub Copilot jest teraz dostawcą: zaloguj się, a Zoo Code wczyta twoje modele Copilot. IO Intelligence to dostawca z własnym kluczem API. Gemini 4 Argon jest w Gemini i Vertex. GPT-6 Luna jest w OpenCode Go. Gemini 4 Argon i GPT-6 Luna są też w Zoo Gateway.",
+			"highlight2": "🧭 Wykonywanie narzędzi: Powtórzenie tego samego wywołania narzędzia daje ostrzeżenie, a potem Zoo Code zatrzymuje tę pętlę. Wyłączenie attempt_completion nie zostawia już zadania, które nie może się zakończyć. Wiadomości w kolejce przechodzą te same kontrole ochrony poleceń co polecenia wysyłane bezpośrednio.",
+			"highlight3": "⚡ Rozumowanie i streaming: Adaptacyjne myślenie Anthropic widać na czacie, a thinking tokeny są liczone. Przełącznik R1 zachowuje rozumowanie z llama.cpp, Ollama i LM Studio. Codex zachowuje zaszyfrowane rozumowanie razem z podsumowaniem, które widzisz. Strumienie modelu językowego VS Code używają guarded recovery, gdy strumień się nie powiedzie."
 		},
 		"cloudAgents": {
 			"heading": "Nowości w chmurze:",
@@ -487,6 +496,10 @@
 		"serversPart_other": "{{count}} serwerów MCP",
 		"messageTemplate": "Masz {{tools}} włączonych przez {{servers}}. Taka duża liczba może zamieszać model i prowadzić do błędów. Staraj się, aby była poniżej {{threshold}}.",
 		"openMcpSettings": "Otwórz ustawienia MCP"
+	},
+	"ignoredDisabledTools": {
+		"title": "Zignorowano wyłączane narzędzie",
+		"messageTemplate": "Następujących narzędzi nie można wyłączyć, dlatego ich wpisy w disabledTools zostały zignorowane: {{tools}}."
 	},
 	"readCommandOutput": {
 		"title": "Zoo read command output"

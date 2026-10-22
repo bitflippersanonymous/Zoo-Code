@@ -47,11 +47,11 @@ Zoo Code s'appuie sur les fondations créées par Roo Code et continue de les en
 - **Des workflows de terminal et d'édition plus fiables** — correctifs pour les fins prématurées de commandes dans le terminal, les conditions de concurrence liées à l'état des tâches, la gestion du contexte, l'édition de diff et l'utilisation d'outils propres aux providers.
 - **Davantage de contrôle sur ton espace de travail** — gestion des règles, restrictions MCP par mode, contrôle des chemins multi-root, options de raisonnement des modèles et actions de vérification des modifications à la fin d'une tâche.
 
-## Nouveautés de la v3.82.0
+## Nouveautés de la v3.90.0
 
-- 🔑 **Utilise ta clé API Zoo Gateway partout** — ajoute-la à n'importe quel client ou workflow compatible avec OpenAI : https://zoocode.dev/models
-- 🎁 **Accès gratuit au modèle pendant une durée limitée** — accède gratuitement à MiniMax-M3 via Zoo Gateway.
-- ✨ **Tout nouveaux modèles** — GPT-6 Astra et Claude Fable 5.1 sont désormais disponibles.
+- ✨ **Fournisseurs et modèles :** GitHub Copilot est maintenant un fournisseur : connecte-toi et Zoo Code charge tes modèles Copilot. IO Intelligence est un fournisseur avec sa propre clé API. Gemini 4 Argon est sur Gemini et Vertex. GPT-6 Luna est sur OpenCode Go. Gemini 4 Argon et GPT-6 Luna sont aussi sur Zoo Gateway.
+- 🧭 **Exécution des outils :** Répéter le même appel d'outil affiche un avertissement, puis Zoo Code arrête cette boucle. Désactiver `attempt_completion` ne laisse plus une tâche incapable de se terminer. Les messages en file passent les mêmes contrôles de protection des commandes que les commandes que tu envoies directement.
+- ⚡ **Raisonnement et streaming :** Le raisonnement adaptatif d'Anthropic s'affiche dans le chat, et les thinking tokens sont comptés. L'option R1 conserve le raisonnement de llama.cpp, Ollama et LM Studio. Codex conserve le raisonnement chiffré avec le résumé que tu vois. Les streams du modèle de langage VS Code utilisent une récupération protégée quand un stream échoue.
 
 ## Que peut faire Zoo Code pour VOUS ?
 
