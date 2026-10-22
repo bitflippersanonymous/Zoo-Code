@@ -1,7 +1,6 @@
 // npx vitest run core/condense/__tests__/stripReasoningAndFit.spec.ts
 
 import { Anthropic } from "@anthropic-ai/sdk"
-import type { ModelInfo } from "@roo-code/types"
 
 import type { ApiHandler } from "../../../api"
 import { ApiMessage } from "../../task-persistence/apiMessages"
@@ -36,23 +35,6 @@ vi.mock("@roo-code/telemetry", () => ({
 }))
 
 const taskId = "test-task-id"
-
-function createMockHandler(
-	tokensPerMessage: number,
-	modelInfo: Partial<ModelInfo> = { contextWindow: 100000, maxTokens: 20000 },
-): ApiHandler {
-	const handler = {
-		createMessage: vi.fn().mockReturnValue(
-			(async function* () {
-				yield { type: "text" as const, text: "A summary" }
-				yield { type: "usage" as const, totalCost: 0.01, outputTokens: 10 }
-			})(),
-		),
-		countTokens: vi.fn().mockResolvedValue(tokensPerMessage),
-		getModel: vi.fn().mockReturnValue({ id: "test-model", info: modelInfo }),
-	} as unknown as ApiHandler
-	return handler
-}
 
 describe("stripReasoningBlocks", () => {
 	it("should strip plain-text reasoning blocks from assistant messages", () => {
